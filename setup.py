@@ -1,5 +1,6 @@
 import argparse
 import boto3
+from botocore.exceptions import ClientError
 import json
 import logging
 from pathlib import Path
@@ -29,24 +30,26 @@ def cleanup(saved_state):
         for line in infile:
             state = json.loads(line)
             client = aws_client(state['profile'])
-            response = client.delete_objects(
-                            Bucket=state['bucket'],
-                            Delete={
-                                'Objects': [
-                                    {
-                                        'Key': '*',
-                                        'VersionId': '*'
-                                    },
-                                ],
-                                'Quiet': False
-                            }
-                        )
-            logger.debug(response)
+            bucket = state['bucket']['name']
 
-            response = client.delete_bucket(
-                            Bucket=state['bucket']
-                        )
-            logger.debug(response)
+            logger.info('Deleting objects from {0} bucket...'.format(bucket))
+            paginator = client.get_paginator('list_object_versions')
+            response_iterator = paginator.paginate(Bucket = bucket)
+            try:
+                for response in response_iterator:
+                    versions = response.get('Versions', [])
+                    versions.extend(response.get('DeleteMarkers', []))
+                    for version in versions:
+                        logger.debug('Deleting {} version {}...'.format(version['Key'], version['VersionId']))
+                        client.delete_object(Bucket = bucket, Key = version['Key'], VersionId = version['VersionId'])
+
+                response = client.delete_bucket(
+                                Bucket=state['bucket']['name']
+                            )
+                logger.debug(response)
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'NoSuchBucket':
+                    logger.info("Bucket no longer exists...")
 
 
 def append_record(record):
@@ -122,7 +125,10 @@ class Bucket:
                     'Rules': [
                         {
                             'ID': 'ReplicationConfiguration' + '-' + uuid.uuid4().hex[:8],
-                            'Prefix': '*',
+                            'Priority': 123,
+                            'Filter': {
+                                'Prefix': ''
+                            },
                             'Status': 'Enabled',
                             'Destination': {
                                 'Bucket': destination_arn,
@@ -131,6 +137,9 @@ class Bucket:
                                 'AccessControlTranslation': {
                                     'Owner': 'Destination'
                                 }
+                            },
+                            'DeleteMarkerReplication': {
+                                'Status': 'Disabled'
                             }
                         }
                     ]
@@ -193,6 +202,7 @@ class Bucket:
 
 def main():
     # TODO Implement Continue logic
+    # TODO Complete Clean Up logic
 
     a = argparse.ArgumentParser()
     a.add_argument('--source', required=True,
@@ -220,8 +230,9 @@ def main():
         if args.cleanup:
             cleanup(STATE_FILE)
             os.remove(STATE_FILE)
-
-        logger.info('Cannot continue. Please add `--cleanup` flag and re-run the script...')
+            logger.info('Cleanup complete...')
+        else:
+            logger.info('Cannot continue. Please add `--cleanup` flag and re-run the script...')
         quit()
 
     Bucket.source_account = args.src_accountid
